@@ -1,0 +1,12 @@
+requests
+os
+pydub
+moviepy
+time
+shutil
+silence
+io
+subprocess
+pytube
+sys
+numpy

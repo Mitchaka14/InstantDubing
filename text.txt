@@ -1,0 +1,276 @@
+# vTranslate
+import os
+import video_processing
+import audio_processing
+import vocal_separation
+import elevenlabs_processing
+import elevenlabs_TTS
+import audioVideoOverlay
+
+
+class VTranslator:
+    def __init__(self, base_folder, video_input, token_1, token_2):
+        self.base_folder = base_folder
+        self.video_input = video_input
+        self.token_1 = token_1
+        self.token_2 = token_2
+        self.output_dir = self.base_folder
+        os.makedirs(self.output_dir, exist_ok=True)
+
+    def process_video(self):
+        print("Starting video processing...")
+        video_path = ""
+        if "youtube.com" in self.video_input:
+            print("Downloading YouTube video...")
+            video_path = video_processing.download_youtube_video(
+                self.video_input, self.output_dir
+            )
+        else:
+            video_path = self.video_input
+
+        print("Extracting audio from video...")
+        audio_path = f"{self.output_dir}/audio_file.mp3"
+        video_processing.extract_audio_from_video(video_path, audio_path)
+
+        action = "translation"
+
+        print("Separating vocals...")
+        vocal_separation.separate_vocals(audio_path, self.output_dir)
+        a_audio_path = f"{self.output_dir}/combined_accompaniments.wav"
+        v_audio_path = f"{self.output_dir}/combined_vocals.wav"
+
+        print("Splitting audio...")
+        audio_chunks = audio_processing.split_audio(v_audio_path, self.token_1)
+
+        print("Processing audio chunks...")
+        results = audio_processing.process_audio_chunks(
+            "translation",
+            audio_chunks,
+            self.token_1,
+        )
+
+        Actionfile = f"{self.output_dir}/{action}.srt"
+        with open(Actionfile, "w", encoding="utf-8") as output_file:
+            for result in results:
+                if result is not None:
+                    output_file.write(result + "\n")
+                    print(f"Result: {result}")
+
+        print("Processing vocal audio...")
+        vID = elevenlabs_processing.process_vocal_audio(
+            v_audio_path, "audiomaker", self.token_2
+        )
+
+        print("Overlaying audios...")
+        output_audio_path = f"{self.output_dir}/Cfinal_audio.mp3"
+        overlay_audio_path = f"{self.output_dir}/final_audio.mp3"
+        output_video_path = f"{self.output_dir}/Translated.mp4"
+        elevenlabs_TTS.process_transcription_file(
+            Actionfile, vID, self.output_dir, self.token_2
+        )
+        audioVideoOverlay.overlay_audios(
+            a_audio_path, overlay_audio_path, output_audio_path
+        )
+        audioVideoOverlay.replace_video_audio(
+            video_path, output_audio_path, output_video_path
+        )
+
+        print("Deleting voice...")
+        elevenlabs_TTS.delete_voice(vID, self.token_2)
+        print("Video processing completed.")
+
+
+------------------------------------------------------------------
+
+# elevenlabs_processing
+import os
+import requests
+import time
+from pydub import AudioSegment
+
+
+def split_audio_into_chunks(audio_path, max_chunk_size_mb=9):
+    print("Loading audio file...")
+    audio = AudioSegment.from_file(audio_path)
+    total_size_mb = len(audio) / (1024 * 1024)
+    num_chunks = int(total_size_mb / max_chunk_size_mb)
+    num_chunks = max(1, num_chunks)  # ensure num_chunks is never less than 1
+    print(f"Splitting audio into {num_chunks} chunks...")
+    chunk_length_ms = len(audio) // num_chunks
+    chunks = make_chunks(audio, chunk_length_ms)
+    return chunks[:19]  # return only the first 19 chunks
+
+
+def make_chunks(audio, chunk_length_ms):
+    chunks = []
+    for i in range(0, len(audio), chunk_length_ms):
+        chunks.append(audio[i : i + chunk_length_ms])
+    return chunks
+
+
+def add_voice_to_elevenlabs(audio_chunks, name, XI_API_KEY):
+    url = "https://api.elevenlabs.io/v1/voices/add"
+    headers = {
+        "accept": "application/json",
+        "xi-api-key": XI_API_KEY,
+    }
+    data = {"name": name}
+    files = []
+    file_objects = []
+    print(f"Creating {len(audio_chunks)} chunks...")
+    for i, chunk in enumerate(audio_chunks):
+        chunk.export(f"temp_chunk_{i}.mp3", format="mp3")
+    print("All chunks created.")
+    for i in range(len(audio_chunks)):
+        file_object = open(f"temp_chunk_{i}.mp3", "rb")
+        files.append(("files", (f"temp_chunk_{i}.mp3", file_object, "audio/mpeg")))
+        file_objects.append(file_object)
+    voice_id = None
+    try:
+        print("Sending request to Eleven Labs API...")
+        response = requests.post(url, headers=headers, data=data, files=files)
+        if response.status_code == 200:
+            voice_id = response.json()["voice_id"]
+            print(f"Voice added successfully. Voice ID: {voice_id}")
+        else:
+            print(
+                f"Failed to add voice. Status code: {response.status_code}, Response: {response.text}"
+            )
+    except requests.exceptions.RequestException as e:
+        print(f"Error sending request: {e}")
+    finally:
+        for file_object in file_objects:
+            file_object.close()
+        for i in range(len(audio_chunks)):
+            os.remove(f"temp_chunk_{i}.mp3")
+    time.sleep(1)  # delay between requests
+    return voice_id
+
+
+def process_vocal_audio(vocal_audio_path, name, XI_API_KEY):
+    print("Starting audio processing...")
+    audio_chunks = split_audio_into_chunks(vocal_audio_path)
+    vID = add_voice_to_elevenlabs(audio_chunks, name, XI_API_KEY)
+    print("Audio processing completed.")
+    return vID
+
+--------------------------------------------------------------------
+
+# elevenlabs_TTS
+import os
+import shutil
+import requests
+import time
+from pydub import AudioSegment, silence
+from io import BytesIO
+
+
+def text_to_speech(text, voice_id, xi_api_key):
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
+    headers = {
+        "Accept": "audio/mpeg",
+        "Content-Type": "application/json",
+        "xi-api-key": xi_api_key,
+    }
+    data = {
+        "text": text,
+        "model_id": "eleven_monolingual_v1",
+        "voice_settings": {
+            "stability": 0.5,
+            "similarity_boost": 0.5,
+        },
+    }
+    response = requests.post(url, json=data, headers=headers)
+    return response.content
+
+
+def convert_time_to_seconds(time_str):
+    h, m, s = time_str.split(":")
+    s, ms = s.split(",")
+    return int(h) * 3600 + int(m) * 60 + float(f"{s}.{ms}")
+
+
+def process_transcription_file(file_path, voice_id, output_dir, xi_api_key):
+    if not os.path.exists(f"{output_dir}/temp_audio_segments"):
+        os.makedirs(f"{output_dir}/temp_audio_segments")
+    with open(file_path, "r") as file:
+        lines = file.readlines()
+        i = 0
+        final_audio = AudioSegment.empty()
+        while i < len(lines):
+            if lines[i].strip() == "":
+                i += 1
+                continue
+            if "-->" in lines[i + 1]:
+                start_time, end_time = map(
+                    convert_time_to_seconds, lines[i + 1].strip().split(" --> ")
+                )
+            else:
+                print(f"Skipping line {i+1}: {lines[i+1]}")
+                i += 1
+                continue
+            text = lines[i + 2].strip()
+            while i + 3 < len(lines) and lines[i + 3].strip() != "":
+                i += 1
+                text += " " + lines[i + 2].strip()
+            while (
+                i + 4 < len(lines)
+                and lines[i + 4].strip() != ""
+                and "-->" in lines[i + 4]
+                and end_time
+                == convert_time_to_seconds(lines[i + 4].strip().split(" --> ")[0])
+            ):
+                i += 3
+                if "-->" in lines[i + 1]:
+                    end_time = convert_time_to_seconds(
+                        lines[i + 1].strip().split(" --> ")[1]
+                    )
+                else:
+                    print(f"Skipping line {i+1}: {lines[i+1]}")
+                    i += 1
+                    continue
+                text += " " + lines[i + 2].strip()
+            final_audio += generate_speech(
+                text, start_time, end_time, voice_id, output_dir, xi_api_key
+            )
+            i += 3
+        final_audio.export(os.path.join(output_dir, "final_audio.mp3"), format="mp3")
+        shutil.rmtree(f"{output_dir}/temp_audio_segments")
+
+
+def generate_speech(text, start_time, end_time, voice_id, output_dir, xi_api_key):
+    audio_data = text_to_speech(text, voice_id, xi_api_key)
+    audio = AudioSegment.from_mp3(BytesIO(audio_data))
+    audio.export(
+        os.path.join(
+            output_dir, f"temp_audio_segments/audio_{start_time}_{end_time}.mp3"
+        ),
+        format="mp3",
+    )
+    intended_duration = (end_time - start_time) * 1000
+    actual_duration = len(audio)
+    if actual_duration < intended_duration:
+        silence_duration = intended_duration - actual_duration
+        silence_segment = AudioSegment.silent(
+            duration=silence_duration
+        )  # Corrected here
+        audio += silence_segment
+    elif actual_duration > intended_duration:
+        audio = audio[:intended_duration]
+    return audio
+
+
+def delete_voice(voice_id, xi_api_key):
+    url = f"https://api.elevenlabs.io/v1/voices/{voice_id}"
+    headers = {
+        "Accept": "application/json",
+        "xi-api-key": xi_api_key,
+    }
+    response = requests.delete(url, headers=headers)
+    if response.status_code == 200:
+        print(f"Voice with ID {voice_id} deleted successfully.")
+    else:
+        print(
+            f"Failed to delete voice. Status code: {response.status_code}, Response: {response.text}"
+        )
+
